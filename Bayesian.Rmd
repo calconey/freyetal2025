@@ -1,0 +1,680 @@
+---
+title: "Bayesian Analysis"
+output: html_document
+date: "2024-11-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r knitr-setup, include=FALSE, eval=TRUE}
+options(digits = 3)
+require(knitr)
+## options
+knitr::opts_chunk$set(eval = TRUE, echo = TRUE, cache = TRUE)
+```
+
+#load packages
+```{r libraries, message=FALSE}
+library(ZIDM) 
+library(tictoc)
+
+library(tibble)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+
+library(matsbyname)
+library(pheatmap)
+
+library(kableExtra)
+```
+# Objective
+Fit a zero-inflated Dirichlet-multinomial (`ZIDM`) model to the compositional counts, and an extension to where the counts as well as potential zero inflation may be a function of the covariates.  The methodology is described in [Koslovsky (2023)](https://doi.org/10.1111/biom.13853). 
+
+
+In this script, we will be showcasing:
+ - a standard Dirichlet-multinomial (`DM`) model
+ - the `ZIDM` (which accounts for zero inflation in the taxon counts)
+ - their extensions to sparsity-induced regression settings, `DMbvs` and `ZIDMbvs` (bvs = Bayesian variable selection)
+ - the [Tuyl method](https://doi.org/10.1080/00031305.2018.1444673) for individual-level count probability estimation
+ 
+We have previously fit the `DMbvs`. This was described in the Wadsworth reports. 
+ 
+```{r functions}
+make_kable <- function(...) {
+  # kable and kableExtra styling to avoid repetitively calling the styling over and over again
+  # See: https://stackoverflow.com/questions/73718600/option-to-specify-default-kableextra-styling-in-rmarkdown
+  # knitr::kable(...) %>%
+  kable(..., format = "html", row.names = TRUE, align = 'l') %>%
+    kable_styling(bootstrap_options = c("striped"), position = "left", font_size = 11, full_width = FALSE) 
+}
+
+prob.plot <- function(data) {
+  # Plot probabilities with a line going up to a red point
+  # Args:
+  #  data  = data frame with columns called x (factor for x-axis) and y (the probabilities)
+  # Returns:
+  #  a ggplot graph of the probabilities
+  ggplot(data, aes(x = x, y = y)) +
+  geom_segment(aes(xend = x, yend = 0), color = "blue") +
+  geom_point(color = "red", size = 3) +
+  expand_limits(y = 0) +
+  labs(x = "Genus", y = "Probability") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 7, angle = -30, hjust = 0, vjust = 0))
+}
+```
+<!-- Data setup -->
+```{r read-the-data}
+
+df4 <- 
+  readxl::read_xlsx("data.xlsx", 
+  # readxl::read_xlsx("data.xlsx",  
+                    sheet = "2122LL_CCROTFUNbact",
+                    range = "A1:BD50",
+                    na = c("NA", ".", "??")) %>%
+  # clean up the names a bit:
+  janitor::clean_names()  %>%
+  # Select variables:
+  # NOTE: response variables are yield, poxc, soil_protein, soil_respiration
+  dplyr::select(year:cover, yield, poxc, soil_protein, soil_respiration, soy_gsavgtc, soy_g_stotalprecipcm, soil_temp_avg4in, avg_relative_h, clay10cm, sand10cm, silt10cm, fusarium:acidothermus) %>% 
+  dplyr::rename(air_temp = soy_gsavgtc, rain = soy_g_stotalprecipcm, soil_temp = soil_temp_avg4in, rh = avg_relative_h, clay = clay10cm, sand = sand10cm, silt = silt10cm) %>% 
+  # Set factors and levels:
+  dplyr::mutate(year = factor(year, levels = c(2021, 2022))) %>% 
+  dplyr::mutate(location = factor(location, levels = c("NWARS", "WARS"))) %>% 
+  dplyr::mutate(rotation = factor(rotation, levels = c("CS", "CSW"))) %>% 
+  dplyr::mutate(cover = factor(cover, levels = c("No Cover", "Rye"))) %>% 
+  # log ratios for sand, silt, clay using silt as the baseline:
+  dplyr::mutate(lr.sand = log(sand) - log(silt)) %>%
+  dplyr::mutate(lr.clay = log(clay) - log(silt)) %>%
+  dplyr::select(-sand, -silt, -clay) %>%
+  # One-hot encode the factor variables:
+  # year
+  dplyr::mutate(yr_2021 = ifelse(year == "2021", 1, 0)) %>% 
+  dplyr::mutate(yr_2022 = ifelse(year == "2022", 1, 0)) %>% 
+  # location
+  dplyr::mutate(loc_NWARS = ifelse(location == "NWARS", 1, 0)) %>% 
+  dplyr::mutate(loc_WARS = ifelse(location == "WARS", 1, 0)) %>% 
+  # rotation
+  dplyr::mutate(rot_CS = ifelse(rotation == "CS", 1, 0)) %>% 
+  dplyr::mutate(rot_CSW = ifelse(rotation == "CSW", 1, 0)) %>%
+  # cover crop
+  dplyr::mutate(cov_none = ifelse(cover == "No Cover", 1, 0)) %>% 
+  dplyr::mutate(cov_rye = ifelse(cover == "Rye", 1, 0)) %>%
+  dplyr::select(-year, -location, -rotation, -cover) %>% 
+  # standardize continuous covariates to mean 0 and std dev 1:
+  dplyr::mutate(across(c(air_temp:rh, lr.sand, lr.clay),  ~ scale(.)[,1])) %>% 
+  # Center yield, poxc, soil_protein, soil_respiration at their sample means:
+  dplyr::mutate(across(c(yield, poxc, soil_protein, soil_respiration), ~ . - mean(., na.rm = TRUE))) %>% 
+  # Arrange the order of the columns so that the responses are first, then the continuous covariates, then the categorical covariates, then the species counts:
+  dplyr::select(yield:soil_respiration, soil_temp, air_temp, rain, rh, lr.sand, lr.clay, yr_2021:cov_rye, fusarium:acidothermus) %>% 
+  # For neatness, title case for the genera:
+  dplyr::rename_with(.fn = stringr::str_to_title, .cols = fusarium:acidothermus) %>% 
+dplyr::rename(air_temperature = air_temp, cover_control = cov_none, cover_rye = cov_rye, l_nwars = loc_NWARS, l_wars = loc_WARS, cs = rot_CS, csw = rot_CSW, soil_temperature = soil_temp, log_ratio_clay = lr.clay, log_ratio_sand = lr.sand) 
+
+# Covariate matrix 49 rows 14 covariates
+X <-
+  df4 %>% 
+  dplyr::select(yield:cover_rye) %>% 
+  as.matrix()
+
+# The taxon counts matrix 49 rows 14 taxa
+Z <-
+  df4 %>% 
+  dplyr::select(Fusarium:Neoascochyta) %>% 
+  as.matrix()
+
+Z2 <-
+  df4 %>% 
+  dplyr::select(Fusarium:Neoascochyta) %>% 
+  as.matrix()
+```
+# Some notation
+We have:
+
+  - $i$ subjects (observations, rows)
+  - $P = 1 \dots p$ covariates (rain, temp, rh, soil, rotation, etc.)
+  - $J = 1 \ldots j$ taxa (fungal genera or species)
+
+
+$\Theta_j$ = population-level zero-inflation probabilities for the $j$ taxa. 
+
+$\Gamma_j$ = population-level count probabilities.  
+
+$\psi_{ij}$ = individual-level count probabilities.  
+
+# Parameter Estimation 
+## A standard Dirichlet-multinomial (`DM`) model
+
+Here we are estimating the probabilities of the `DM` for the counts of the fungal genera.
+
+```{r standard-DM-fit, message=FALSE, results='hide'}
+# Fit the DM model to the data (run for more iterations than the default 10,000)
+tic()
+fit_DM <- DM_R(Z, iterations = 20000)
+toc()
+
+# Obtain estimates of DM model
+DM_est <- estimates_DM(dm_obj = fit_DM, burnin = 1000, CI = 0.95)
+
+# DM_est is a list of six:
+# Note there is no post_theta. Why? Because the DM model does not account for zero-inflation.
+
+## Population-level count probabilities (14 because there are 14 taxa)
+# post_gamma
+# post_gamma_lower
+# post_gamma_upper
+
+## Individual-level count probabilities
+# post_psi  # dim = 49, 14 of course, for each row and taxon
+# post_psi_lower
+# post_psi_upper
+
+# Sum of the population-level count probabilities is ~1:
+# sum(DM_est$post_gamma)
+```
+
+### Example of the individual-level probabilities
+```{r standard-DM-individual-level-probs, results='hide'}
+# Individual (observation) 1: the probabilities do sum to 1
+sum(DM_est$post_psi[1, ])
+
+# Note that NONE of the probabilities is zero, which is one of the characteristics of the DM model, in which the estimated probabilities of counts are strictly positive, even when the true probability of occurrence is zero.
+sum(DM_est$post_psi[1, ] == 0)
+
+# And you can plot the probabilities:
+# individual-level count probabilities for individual (observation) 1:
+data.frame(x = factor(colnames(Z)), y = DM_est$post_psi[1, ]) %>% 
+  # Plot the data:
+  prob.plot() +
+  ggtitle("Standard DM Obs 1")
+```
+
+### The population-level probabilities
+  
+```{r standard-DM-population-level-probs}
+# population-level count probabilities:
+data.frame(x = factor(colnames(Z)), y = DM_est$post_gamma) %>% 
+  # Plot the data:
+  prob.plot() +
+  ggtitle("Standard DM population-level count probabilities") +
+  ylim(0, 0.25)
+```
+
+## Tuyl approach to individual-level probabilities
+Another method for obtaining individual-level probabilities was proposed by Frank Tuyl. 
+
+Koslovsky (2023) constructed a Monte Carlo sampling algorithm to obtain uncertainty estimates using Tuyl's approach. The following code chunk fits the probabilities using Tuyl's approach.
+
+```{r Tuyl-individual-level-probs, results='hide'}
+# Fit Tuyl's approach to the data and obtain uncertainty estimates via Monte Carlo sampling
+fit_tuyl <- tuyl_meaner(Z) 
+# These are Tuyl's individual-level count probabilities:
+dim(fit_tuyl)  # 49 obs 14 genera
+
+# Example: for individual (observation) 1, the probabilities sum to 1:
+sum(fit_tuyl[1, ])
+# And this is true for all 49 observations:
+apply(fit_tuyl, 1, sum)
+
+# But again, the probabilities for any given individual are strictly positive. 
+# Example: for individual 1:
+sum(fit_tuyl[1, ] > 0)
+
+# MC sampling:
+tic()
+uncertainty_tuyl <- tuyl(40000, Z)
+toc() # 37 sec
+
+dim(uncertainty_tuyl)  # 49  14  40000
+
+# The individual-level count probability means over the MC samples:
+uncertainty_tuyl_mean <- apply(uncertainty_tuyl, c(1, 2), mean)
+
+# And we can plot the individual-level count probabilities. 
+# Here we do so for the 1st individual (observation):
+data.frame(x = factor(colnames(Z)), y = fit_tuyl[1, ]) |>
+  prob.plot() +
+  ggtitle("Tuyl fit Obs 1")
+
+# Compare to the MC means (plots are basically the same):
+data.frame(x = factor(colnames(Z)), y = uncertainty_tuyl_mean[1, ]) |>
+  prob.plot() +
+  ggtitle("Tuyl Monte Carlo mean Obs 1")
+
+# remove the very large uncertainty_tuyl object:
+rm(uncertainty_tuyl)
+```
+
+## ZIDM model
+```{r fit-ZIDM-model-no-covariates, results='hide'}
+# REMINDER: 49 individuals (obs), 14 genera
+# dim(Z)
+
+# Fit the ZIDM model to the data (increasing the iterations to 20,000, thinning every 10th)
+tic()
+fit_ZIDM <- ZIDM_R(Z, iterations = 20000)
+toc()
+
+# Obtain estimates from ZIDM
+ZIDM_est <- estimates_ZIDM(zidm_obj = fit_ZIDM, burnin = 1000, CI = 0.95)
+```
+
+### Understanding the ZIDM model
+Let's look at the model components.
+
+```{r understand-ZIDM-model}
+names(ZIDM_est) %>% 
+  make_kable()
+## Population-level zero-inflation probabilities:
+# post_theta
+# post_theta_lower
+# post_theta_upper
+
+## Population-level count probabilities:
+# post_gamma
+# post_gamma_lower
+# post_gamma_upper
+
+## individual-level count probabilities:
+# post_psi
+# post_psi_lower
+# post_psi_upper
+```
+### Individual-level probabilities
+```{r ZIDM-model-individual-level-probs, results='hide'}
+# individual-level count probabilities:
+dim(ZIDM_est$post_psi)  # 49 obs 14 genera
+
+# The estimated probs for individual (observation) 1, for the 14 genera:
+ZIDM_est$post_psi[1, ]
+
+# And converted to relative abundances (maybe a little easier to decifer):
+ZIDM_est$post_psi[1, ]*100
+
+# the individual-level probs do sum to 1 for each of the 49 individuals:
+apply(ZIDM_est$post_psi, 1, sum)
+
+# NOTE: compared to the DM model, some individual-level count probabilities COULD BE set to 0!
+# However, that's not the case with these data -- all individual-level probabilities are >0
+apply(ZIDM_est$post_psi, MARGIN = 1, function(x) sum(ZIDM_est$post_psi[x, ] == 0))
+
+# Plot the individual-level probs for obs 1:
+data.frame(x = factor(colnames(Z)), y = ZIDM_est$post_psi[1, ]) |>
+  # Plot the data:
+  prob.plot() +
+  ggtitle("ZIDM model Obs 1")
+
+# We see that the estimated probs are very similar to what we saw with the DM and Tuyl models
+```
+
+### Population-level probabilities
+
+```{r ZIDM-model-population-level-probs, results='hide'}
+### ---Understanding the output--- ###
+## The zero-inflation probabilities (ZIP)
+length(ZIDM_est$post_theta)  # 14 as there are this number of genera
+# The point estimate and CI of the ZIP for the first genus:
+c(ZIDM_est$post_theta_lower[1], ZIDM_est$post_theta[1], ZIDM_est$post_theta_upper[1])
+
+# population-level count probabilities:
+length(ZIDM_est$post_gamma)  # 14
+# The point estimate and CI of the count for the first genus:
+c(ZIDM_est$post_gamma_lower[1], ZIDM_est$post_gamma[1], ZIDM_est$post_gamma_upper[1])
+### ------------------------------ ###
+
+
+# Population-level zero-inflation probabilities:
+data.frame(x = factor(colnames(Z2)), y = ZIDM_est$post_theta) |>
+  # Plot the data:
+  prob.plot() +
+  ggtitle("ZIDM population-level zero-inflation probabilities")
+
+# Population-level count probabilities:
+data.frame(x = factor(colnames(Z2)), y = ZIDM_est$post_gamma) |>
+  # Plot the data:
+  prob.plot() +
+  ggtitle("ZIDM population-level count probabilities") +
+  ylim(0, 0.9)
+```
+
+```{r DM-vs-ZIDM-comparison}
+# The observed population counts for each genus:
+popn_count <- 
+  df4 %>% 
+  dplyr::select(Fusarium:Neoascochyta) %>% 
+  dplyr::summarise(across(everything(), sum)) %>% 
+  tidyr::pivot_longer(cols = everything(), 
+                      names_to = "genus", 
+                      values_to = "count") %>% 
+  dplyr::mutate(genus = factor(genus)) %>% 
+  dplyr::arrange(genus)
+  
+
+# total of the population counts:
+total_sum <- sum(popn_count$count)
+
+# the estimated (pred) counts based on the fitted DM model:
+DM_est_count <- 
+  data.frame(genus = factor(colnames(Z)), prob = DM_est$post_gamma) %>% 
+  dplyr::mutate(pred = prob*total_sum) %>% 
+  dplyr::arrange(genus)
+
+# the estimated (pred) counts based on the fitted ZIDM model:
+ZIDM_est_count <- 
+  data.frame(genus = factor(colnames(Z)), prob = ZIDM_est$post_gamma) %>% 
+  dplyr::mutate(pred = prob*total_sum) %>% 
+  dplyr::arrange(genus)
+
+
+# The RMSE (measure of the difference between the actual and predicted counts) for the DM model:
+DM_est_count %>% 
+  dplyr::left_join(popn_count, by = "genus") %>% 
+  dplyr::mutate(sqdif = (pred-count)^2) %>% 
+  dplyr::summarise(RMSE = sqrt(mean(sqdif)))
+
+# The RMSE for the ZIDM model:
+ZIDM_est_count %>% 
+  dplyr::left_join(popn_count, by = "genus") %>% 
+  dplyr::mutate(sqdif = (pred-count)^2) %>% 
+  dplyr::summarise(RMSE = sqrt(mean(sqdif)))
+```
+
+## `ZIDM` with variable selection (`ZIDMbvs` method)
+
+In this section, we apply the `ZIDMbvs` model to identify covariates associated with zero-inflation and compositional counts. 
+
+By default the model is run for $10,000$ iterations, thinning to every $10^{th}$ iteration. 
+
+Based on the experience with this data thus far, I am going to run for $40,000$ iterations thinning every $10^{th}$ iteration.
+
+We assume the same covariates (X) are potentially associated with zero-inflation and with the compositional counts.
+
+The output of the model contains MCMC samples for $\varphi$, $\beta_\gamma$, $\eta$, $\beta_\theta$, $\zeta$, $\omega$, $c$, and the acceptance probability of $\eta$ (`eta_accept`). These components of the model are explained in the [Koslovsky (2023) paper](https://doi.org/10.1111/biom.13853). 
+
+```{r fit-ZIDMbvs, results='hide'}
+tic()
+fit_ZIDMbvs <- ZIDMbvs_R(Z = Z, X = X, X_theta = X, iterations = 50000)
+toc()
+```
+
+
+#exploring the model fit parts
+
+```{r ZIDMbvs-model-parts, eval=FALSE}
+# fit_ZIDMbvs is a list with the MCMC samples for the following parameters:
+
+## varphi = inclusion vector
+# varphi = j x (p+1) matrix, (p+1) because the intercept is included
+dim(fit_ZIDMbvs$varphi)  # 14 15 4000 (MCMC samples)
+# The first column in each matrix is all 1's, representing the intercept:
+fit_ZIDMbvs$varphi[, 1, 1]
+# the inclusion vector for the 1st taxon and MCMC sample:
+fit_ZIDMbvs$varphi[1, , 1]
+# varphi = 1 if covariate p is associated with taxon j, and 0 otherwise
+# For example, for taxon 12, the first MCMC sample:
+fit_ZIDMbvs$varphi[12, -1, 1]  # -1 to remove the intercept
+
+## beta_gamma = the regression coefs associated with the taxon counts
+# beta_gamma = j x (p+1) matrix, (p+1) because the intercept is included
+dim(fit_ZIDMbvs$beta_gamma)  # 14 15 4000
+# The first column in each matrix is the intercept:
+fit_ZIDMbvs$beta_gamma[, 1, 1]
+# The coefs (note the 1st is the intercept) for the 1st taxon and MCMC sample:
+fit_ZIDMbvs$beta_gamma[1, , 1]
+# For example, for taxon 12, the coefs in the first MCMC sample:
+fit_ZIDMbvs$beta_gamma[12, -1, 1]  # -1 to remove the intercept
+# The means over the mcmc samples, for the 1st taxon, remove the intercept:
+# (we remove the 1st 2000 MCMC samples as burn-in)
+(bg <- apply(fit_ZIDMbvs$beta_gamma[, , 2001:4000], c(1, 2), mean)[1, -1])
+# and the range of the above:
+range(bg)
+
+
+## eta
+# eta(i,j) = at-risk indicator [0,1] for the taxon counts: i x j matrix
+# eta = 0 implies a structural zero
+dim(fit_ZIDMbvs$eta)  # 49 (obs) 14 (taxa) 4000 (MCMC samples)
+# For example, for taxon 12, in the first MCMC sample:
+fit_ZIDMbvs$eta[, 12, 1]
+# For the 1st observation, the 1st MCMC sample:
+fit_ZIDMbvs$eta[1, , 1]
+# The means over the MCMC samples, the 1st subject
+apply(fit_ZIDMbvs$eta[, , 2001:4000], c(1, 2), mean)[1, ]
+
+
+## beta_theta
+# beta_theta = j x (p+1) matrix, including the intercept, regression coefs associated with zero-inflation probabilities for the taxa
+dim(fit_ZIDMbvs$beta_theta)  # 14 (taxa) 15 (intercept + covariates) 4000 (MCMC samples)
+# The first column in each matrix is the intercept:
+fit_ZIDMbvs$beta_theta[, 1, 1]
+# For example, for taxon 12, the coefs in the first MCMC sample:
+fit_ZIDMbvs$beta_theta[12, -1, 1]  # -1 to remove the intercept
+
+
+## zeta
+# zeta = latent sparsity indicator j x (p+1) matrix, including the intercept, for covariates associated with zero-inflation probabilities
+dim(fit_ZIDMbvs$zeta) # 14 (taxa) 15 (intercept + covariates) 4000 (MCMC samples)
+# The first column in each matrix is the intercept (always included):
+fit_ZIDMbvs$zeta[, 1, 1]
+# zeta = 1 if covariate p is associated with taxon j, and 0 otherwise
+# For example, for taxon 12, the first MCMC sample:
+fit_ZIDMbvs$zeta[12, -1, 1]  # -1 to remove the intercept
+# The means over the MCMC samples, for the 1st taxon, remove the intercept:
+apply(fit_ZIDMbvs$zeta[, , 2001:4000], c(1, 2), mean)[1, -1]
+
+
+## omega
+# omega (i,j) = auxillary parameter for each eta
+dim(fit_ZIDMbvs$omega)  # 49 (obs) 14 (taxa) 4000 (MCMC samples)
+# For example, for taxon 12, in the first MCMC sample:
+fit_ZIDMbvs$omega[, 12, 1]
+# For the 1st observation, the 1st MCMC sample:
+fit_ZIDMbvs$omega[1, , 1]
+
+
+## eta_accept
+# eta_accept (i,j) = the acceptance probability of eta
+dim(fit_ZIDMbvs$eta_accept)  # 49 (obs) 14 (taxa) 4000 (MCMC samples)
+# For example, for taxon 12, in the first MCMC sample:
+fit_ZIDMbvs$eta_accept[, 12, 1]
+# For the 1st observation, the 1st MCMC sample:
+fit_ZIDMbvs$eta_accept[1, , 1]
+# The means over the MCMC samples, for the 1st taxon:
+apply(fit_ZIDMbvs$eta_accept[, , 2001:4000], c(1, 2), mean)[1, ]
+
+
+## cc
+# cc (i,j) = latent variable for the DM counts
+dim(fit_ZIDMbvs$cc) # 49 (obs) 14 (taxa) 4000 (MCMC samples)
+# For example, for taxon 12, in the first MCMC sample:
+fit_ZIDMbvs$cc[, 12, 1]
+# For the 1st observation, the 1st MCMC sample:
+fit_ZIDMbvs$cc[1, , 1]
+```
+### Model convergence
+To demonstrate the convergence of the algorithm, we plot the number of active terms in the model over MCMC iterations
+
+```{r ZIDMbvs-assess-convergence}
+# What the next line does: sums across the array's third dimension
+y <- apply(fit_ZIDMbvs$zeta, 3, sum)
+x <- 1:length(y)
+dat <- data.frame(x, y)
+
+conv1 <-  
+  ggplot(dat, aes(x, y)) + 
+  geom_line(aes(x = x, y = y)) + 
+  labs(x = "MCMC Sample", y = "Count",  title = " At-Risk Indicator Active Terms") + 
+  theme(title = element_text(size = 10))
+
+
+y <- apply(fit_ZIDMbvs$varphi, 3, sum)
+x <- 1:length(y)
+dat <- data.frame(x, y)
+conv2 <-  
+  ggplot(dat, aes(x, y)) + 
+  geom_line(aes(x = x, y = y)) + 
+  labs(x = "MCMC Sample", y = "Count",  title = "Compositional Count Active Terms") + 
+  theme(title = element_text(size = 10))
+
+conv1 + conv2
+```
+### MPPIs 
+Inclusion is determined with the marginal posterior probability of inclusion (MPPI) for each compositional element-by-covariate inclusion indicator. By default, the MPPI threshold for significant terms is set to $0.50$. 
+
+However, as with the past model fits, I think we may have to use a lower threshold. 
+
+The plots of the corresponding MPPIs for both levels of the model are presented below. The horizontal dotted line indicates the selection threshold. Covariates with corresponding MPPIs above $0.40$ are considered active in the model.
+
+```{r ZIDMbvs-plot-MPPI, results='hide'}
+# What this is doing:
+# Over the last 2000 mcmc samples (when you have convergence), the mean for each taxon and covariate: 
+MPPI_varphi <- apply(fit_ZIDMbvs$varphi[, , 2001:4000], c(1, 2), mean)
+dim(MPPI_varphi)  # 14 15 (j, p+1)
+
+MPPI_zeta <- apply(fit_ZIDMbvs$zeta[, , 2001:4000], c(1, 2), mean) 
+dim(MPPI_zeta) # 14 15 (j, p+1)
+
+y <- c(MPPI_zeta[, -1]) # converting to vector, but without the intercept column 1
+x <- seq(1, length(y))  # length is 2716 = 28*(98-1)
+data <- data.frame(cbind(x, y))
+
+# Set a selection threshold that is different from the default of 0.5:
+selection_threshold <- 0.45
+
+aa <- 
+  ggplot(data, aes(x, y)) + 
+  geom_segment(aes(xend = x, yend = 0), linewidth = 0.2, lineend = "butt") + 
+  labs(x = "Covariate Index",                                                                          y = "MPPI", 
+       title = " At-Risk Indicator Associations") + 
+  geom_abline(slope = 0, intercept = selection_threshold, linetype = "dashed") + 
+  theme(title = element_text(size = 8))
+
+yb <- c(MPPI_varphi[, -1])
+xb <- seq(1, length(yb))
+datab <- data.frame(cbind(xb, yb))
+
+bb <- 
+  ggplot(datab, aes(xb, yb)) + 
+  geom_segment(aes(xend = xb, yend = 0), linewidth = 0.2, lineend = "butt") + 
+  labs(x = "Covariate Index", y = "MPPI", title = "Compositional Count Associations") +
+  geom_abline(slope = 0, intercept = selection_threshold, linetype = "dashed") + 
+  theme(title = element_text(size = 8))
+
+# The plots:
+aa + bb
+```
+
+### Heatmap summaries 
+We use a heatmap to visualize the associations between the genera and covariates as identified by the model. 
+
+#### Selection threhold = $0.40$
+```{r ZIDMbvs-heatmap-0.4, results='hide'}
+# Matt sent me the code for the heatmap. He uses the pheatmap package.
+
+# REMINDER:
+dim(X)  # 49 observations  14 covariates
+dim(Z)  # 49 observations  14 taxa (genera)
+
+# Will need the names for the matrix of coefs later:
+# colnames(X)
+# colnames(Z)
+
+# Set the selection threshold:
+selection_threshold <- 0.45
+
+# The posterior inclusion probabilities for the compositional count associations:
+MPPI_varphi <- apply(fit_ZIDMbvs$varphi[ , , 2001:4000], c(1, 2), mean)
+# Remove the intercept:
+MPPI.phi <- MPPI_varphi[, -1] 
+# MPPI threshold for significant terms is set to selection_threshold:
+MPPI.phi <- (MPPI.phi > selection_threshold)*1
+# The coefficients:
+beta_gamma <- apply(fit_ZIDMbvs$beta_gamma[ , , 2001:4000], c(1, 2), mean)[, -1]
+
+# Both objects are the same dimension (as they should be):
+# dim(MPPI.phi)
+# dim(beta_gamma)
+
+# Multiply the matrices to get the coefs to keep, the others set to zero:
+coef.cc <- MPPI.phi*beta_gamma
+
+# The posterior inclusion probabilities for the at-risk (zero-inflation) counts:
+MPPI_zeta <- apply(fit_ZIDMbvs$zeta[ , , 2001:4000], c(1, 2), mean) 
+MPPI.zeta <- MPPI_zeta[, -1]
+MPPI.zeta <- (MPPI.zeta > selection_threshold)*1
+# The coefficients:
+beta_theta <- apply(fit_ZIDMbvs$beta_theta[ , , 2001:4000], c(1, 2), mean)[, -1]
+
+# dim(MPPI.zeta)
+# dim(beta_theta)
+
+coef.zi <- MPPI.zeta*beta_theta
+
+# The final matrix of the coefs:
+foo <- coef.cc + coef.zi
+
+dim(foo)  # 14 taxa  14 covariates
+
+# CHECK: the range of the coefs (to determine how to set the breaks for the color palette below):
+foo |>
+  c() |>
+  range()
+
+
+# CHECK: the non-zero entries:
+###
+# colnames(foo) <- colnames(X)
+# mz <-
+#   foo %>%
+#   # convert the matrix to a tibble:
+#   as_tibble(foo) %>%
+#   # add column of the taxon names at the beginning:
+#   dplyr::mutate(taxon = colnames(Z), .before = everything())
+# 
+# mz %>%
+#   # going to perform operations rowwise:
+#   dplyr::rowwise() %>%
+#   # getting to the non-zero entries:
+#   dplyr::mutate(total = sum(c_across(where(is.numeric)))) %>%
+#   dplyr::filter(!total == 0) %>%
+#   dplyr::select(where(~ any(. != 0)))
+###
+
+
+# Plot the Figure
+R <- foo
+colnames(R) <- colnames(X)
+rownames(R) <- colnames(Z)
+# May be nice to sort the matrix rows and columns:
+R <- matsbyname::sort_rows_cols(R)
+
+paletteLength <- 100
+myColor <- colorRampPalette(c("dodgerblue3","ivory1","tomato3"))(paletteLength)
+myBreaks <- c(seq(min(R), 0, length.out = ceiling(paletteLength/2) + 1), seq(max(R)/paletteLength, max(R), length.out = floor(paletteLength/2)))
+
+
+pheatmap(R, name="ZIDM association", color = myColor, breaks = myBreaks, fontsize = 15,  treeheight_row = 0, treeheight_col  = 0, angle_col = 315, cluster_rows = FALSE, cluster_cols = FALSE)
+```

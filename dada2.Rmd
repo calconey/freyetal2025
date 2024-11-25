@@ -1,0 +1,173 @@
+---
+title: "dada2"
+output: html_document
+date: "2024-11-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+
+# load packages for dada2
+```{r}
+library("phyloseq")
+library("ggplot2")
+library("readxl")       # necessary to import the data from Excel file
+library("dplyr")        # filter and reformat data frames
+library("tibble") 
+library("dada2")
+library("gridExtra")
+```
+#set directories
+```{r}
+setwd("/directory") 
+path <- ("/directory")
+fn <- list.files(path, pattern=".fastq", full.names=TRUE, recursive=TRUE)
+basename(fn)
+```
+#Dereplicating, generate list of unique sequence read number 
+Short steps
+```{r}
+drp <- derepFastq(fn, verbose=TRUE)
+sam <- sapply(strsplit(basename(fn), "_"), `[`, 1)
+```
+
+```{r}
+nunq <- Vectorize(function(x) length(getUniques(x)))
+nread <- Vectorize(function(x) sum(getUniques(x)))
+readsTSF <- data.frame(row.names=sam, Reads=nread(drp), Uniques=nunq(drp))
+write.csv(readsTSF,"readsTSF.csv", row.names = TRUE)
+```
+```{r}
+unq.seqlens <- function(x) {
+  rep(nchar(getSequences(x)), times=x$uniques)
+}
+lendf <- data.frame(Sample=rep(sam, times=nread(drp)), Length=unlist(lapply(drp, unq.seqlens)))
+lendf
+```
+```{r}
+unique_samples = unique(lendf$Sample)
+plot_list = list() 
+idx = 1
+
+for(s in unique_samples) {
+  plot_list[[idx]] <- ggplot(data=subset(lendf, Sample == s), aes(x=Length)) +
+    geom_histogram(bins=100) +
+    facet_wrap(~Sample)
+  idx = idx + 1
+}
+
+marrangeGrob(plot_list, nrow=2, ncol=2)
+```
+#  Generate quality plots
+
+```{r}
+plotQualityProfile(fn)
+```
+```{r}
+filt <- file.path("filtered", basename(fn)) # write out filted+primer-free fastq to filtered/ subdirectory
+track <- filterAndTrim(fn, filt, maxEE=2, minLen=250, maxLen=1000, minQ=3) 
+track
+```
+```{r}
+
+for (i in 1:length(fn)){ 
+  print(sprintf("Processing sample %d of %d", i, length(filt)))
+  print(plotQualityProfile(filt[i]))
+}
+
+```
+#First learn the error rates on default settings:
+If skipping primer removal steps use fn instead of filt below
+#takes a few hours to run in some cases, will be significantly shorter if you previously used ITSx
+#reccommend running overnight.
+```{r}
+err <- learnErrors(filt, multi=TRUE, verbose=TRUE) # Probably the longest running part
+plotErrors(err, nominalQ=TRUE)
+```
+```{r}
+dd <- dada(filt, err, multi=TRUE, verbose=TRUE)
+dd
+```
+#Make sequence table and remove chimeras:
+#st= asv table
+```{r}
+sta <- makeSequenceTable(dd)
+st <- removeBimeraDenovo(sta, minFoldParentOverAbundance=4.5, multi=TRUE, verbose=TRUE)
+```
+
+#track progress
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(track, dd, rowSums(st))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoised", "nonchim")
+head(track)
+```
+
+```{r}
+# giving our seq headers more manageable names (ASV_1, ASV_2...)
+asv_seqs <- colnames(st)
+asv_headers <- vector(dim(st)[2], mode="character")
+
+for (i in 1:dim(st)[2]) {
+  asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+# making and writing out a fasta of our final ASV seqs:
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta, "ASVsCornRfullseqpostdada.fa")
+
+# count table:
+asv_tab <- t(st)
+row.names(asv_tab) <- sub(">", "", asv_headers)
+write.table(asv_tab, "ASVs_countsROTCORN.tsv", sep="\t", quote=F, col.names=NA)
+```
+#assign taxonomy
+```{r}
+filename.rds <- "taxonomy_18s_S22corn.rds"
+if(!file.exists(filename.rds)) {
+  tax <- assignTaxonomy(st, "/fs/scratch/PAS1548/TSF/UNITE/sh_general_release_dynamic_29.11.2022.fasta", multi=TRUE, verbose=TRUE)
+  
+  saveRDS(tax, filename.rds)
+}
+
+tax <- readRDS(filename.rds)
+if(!identical(getSequences(tax), getSequences(st))) stop("Taxonomy mismatch.")
+table(tax[,"Phylum"], useNA="ifany")
+
+```
+#generate phyloseq object
+```{r}
+otus <- st
+mapping <- read.csv("22LLMETAAMF.csv", header = T, row.names = 1, fill=TRUE, sep = ",")
+taxonomy <- tax
+
+o <- otu_table(st, taxa_are_rows=FALSE)
+s <- sample_data(mapping)
+t <- tax_table(taxonomy)
+t <- replace(t, t == " ", NA)
+phylo <- phyloseq(o,s,t) 
+phylo
+```

@@ -1,0 +1,394 @@
+---
+title: "Basic Data Analysis, DESeq2, Networks"
+output: html_document
+date: "2024-11-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r}
+# Load the packages
+library(phyloseq)
+library(tidyverse)
+library("ggplot2")
+library("readxl")       # necessary to import the data from Excel file
+library("dplyr")        # filter and reformat data frames
+library("tibble")
+library("ggpubr")
+library("RColorBrewer")
+library(patchwork)
+library(microViz)
+library(microbiome)
+library(vegan)
+library(DBI)
+library("DESeq2")
+library("NetCoMi")
+library("ggvenn")
+```
+# Create phyloseq object
+```{r}
+# Create the phyloseq object
+ps <- phyloseq(otu_table(st, taxa_are_rows = TRUE),
+               sample_data(mapping),
+               tax_table(tax))
+ps
+```
+#Alpha Diversity
+```{r}
+# Make alpha diversity figure
+prl <- plot_richness(ps,
+              x = "Location",
+              measures = c("Observed", "Shannon"),
+              color = "Location",
+              nrow = 1)
+
+prl +  geom_boxplot() +
+  geom_jitter(width = 0.05) +
+  scale_color_manual(values=c("seagreen2","purple3" )) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 0, hjust = 0.5, size=11)) +
+  labs(x = "Location", y = "Diversity")
+```
+#Beta diversity analysis
+```{r}
+# Non-metric MultiDimensional Scaling (NMDS)
+ord.nmds.jsd_slv <- ordinate(ps, method = "NMDS", distance = "jsd")
+```
+```{r}
+# Create a "stressplot"
+stressplot(ord.nmds.jsd_slv)
+```
+```{r}
+plot_ordination(ps, ord.nmds.jsd_slv,
+                color = "Location", shape = "Rotation") +
+  geom_point(size = 4) +
+  scale_color_manual(values=c("seagreen2","purple3" )) +
+  coord_fixed() +
+   ylim (-0.5,0.5) +
+  xlim (-0.5,0.5) +
+  stat_ellipse(type = "t") 
+
+ggsave(filename = "fun22beta.png", plot_ordination(ps, ord.nmds.jsd_slv,
+                color = "Location", shape = "Rotation") +
+  geom_point(size = 4) +
+  scale_color_manual(values=c("seagreen2","purple3" )) +
+  coord_fixed() +
+  ylim (-0.8,0.8) +
+  xlim (-0.8,0.8) +
+  stat_ellipse(type = "t") + geom_point(size=2, shape=23),width = 5, height = 4, dpi = 300, units = "in", device='png')
+```
+#PERMANOVA
+```{r}
+# Storing our metadata in a data frame
+sampledf <- data.frame(sample_data(psfam22C))
+
+# Selecting our distance method (in this case the same as we used for NMDS,
+# Jensen-Shannon divergence, but we could use different options here)
+dist.mat <- phyloseq::distance(psfam22C, method = "jsd")
+
+# Selecting the number of permutations to perform
+perm <- how(nperm = 999)
+# Selecting blocks from the experiment
+setBlocks(perm) <- with(sampledf, Block)
+
+# Run PERMANOVA with the selected distance method and your variables of interest
+# (in this case, location and rotation)
+adonis2(dist.mat ~ Location * Rotation * Cover,
+        data = sampledf, permutations = perm)
+```
+#DESEQ2 
+
+```{r}
+sto <- st + 1
+o <- otu_table(sto, taxa_are_rows=TRUE)
+s <- sample_data(mapping)
+tna <- tax_table(tax)
+phylona <- phyloseq(o,s,tna) 
+phylona
+```
+```{r}
+fungisdsd <- phyloseq_to_deseq2(fungisna, ~Rotation)
+```
+```{r}
+fungisdsd <- DESeq(fungisdsd, test="Wald", fitType="parametric")
+```
+```{r}
+dsHvN <-results(fungisdsd)
+dsHvM <-results(fungisdsd, contrast=c("Rotation","CS", "CSW"))
+dsHvM
+
+```
+```{r}
+plotDispEsts( fungisdsd, ylim = c(1e-6, 1e1) )
+```
+```{r}
+res = results(fungisdsd,contrast=c("Rotation","CS", "CSW"), cooksCutoff = FALSE)
+alpha = 0.01
+sigtab = res[which(res$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(fungisna)[rownames(sigtab), ], "matrix"))
+head(sigtab)
+```
+#plot DESEQ data
+```{r}
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtabrot22$log2FoldChange, sigtabrot22$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabrot22$Phylum = factor(as.character(sigtabrot22$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtabrot22$log2FoldChange, sigtabrot22$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtabrot22$Genus = factor(as.character(sigtabrot22$Genus), levels=names(x))
+ggplot(sigtabrot22, aes(x=log2FoldChange, y=Genus)) + geom_point(aes(color=Rotation)) + geom_point(size=5, alpha = 0.05) + xlim(-5,7) + scale_color_manual(values = c("CS" = "royalblue2",
+                                "CSW"="darkorange")) +
+ theme(axis.text.x = element_text(angle = 0, hjust = 0, vjust=0.5, size=11), axis.text.y = element_text(size=12), axis.title.x = element_text(size = 12),axis.title.y = element_text(size = 12))
+```
+#Network Analysis
+
+```{r}
+ncores = 24
+
+
+
+ps.cs <- phyloseq::subset_samples(ps, Rotation == "CS")
+ps.csw <- phyloseq::subset_samples(ps, Rotation == "CSW")
+ps.nc <- phyloseq::subset_samples(ps, Cover == "No Cover")
+ps.rye <- phyloseq::subset_samples(ps, Cover == "Rye")
+ps.nw <- phyloseq::subset_samples(ps, Location == "NWARS")
+ps.w <- phyloseq::subset_samples(ps, Location == "WARS")
+
+netFun <- function(x, y, method){
+  net_seas_p <- netConstruct(x, y,
+                             filtTax = "highestVar",
+                             filtTaxPar = list(highestVar = 200),
+                             zeroMethod = "none",
+                             normMethod = "none",
+                             measure = "pearson",
+                             cores = ncores,
+                             verbose = 2,
+                             seed = 123456)
+  network <- netAnalyze(net_seas_p, 
+                        clustMethod = "cluster_fast_greedy", 
+                        weightDeg = TRUE, 
+                        normDeg = FALSE, 
+                        hubPar = c("degree", "between", "closeness"),
+                        hubQuant=0.95)
+  return(network)      
+}
+
+netPlot <- function(x, g1, g2){
+  nclust <- as.numeric(max(names(table(x$clustering$clust1))))
+  col <- topo.colors(nclust)
+  
+  n_nodes1 <- ncol(x$input$normCounts1)
+  n_nodes2 <- ncol(x$input$normCounts2)
+  asv_names1 <- colnames(x$input$normCounts1)
+  asv_names2 <- colnames(x$input$normCounts2)
+  node_labs <- rep("", n_nodes1 + n_nodes2)
+  names(node_labs) <- c(asv_names1, asv_names2)
+  
+  plot(x,
+       sameLayout = TRUE,
+       layoutGroup = "union",
+       colorVec = col,
+       borderCol = "gray40",
+       nodeSize = "degree",
+       cexNodes = 0.9,
+       labels= FALSE,
+       nodeSizeSpread = 3,
+       edgeTranspLow = 80,
+       edgeTranspHigh = 50,
+       groupNames = c(g1, g2),
+       showTitle = FALSE,
+       cexTitle = 2.8,
+       mar = c(1,1,3,1),
+       repulsion = 1.3,
+       shortenLabels = "simple",
+       rmSingles = "inboth",
+       nodeFilter = "clustMin",
+       nodeFilterPar = 10,
+       nodeTransp = 50,
+       hubTransp = 30,
+       highlightHubs = TRUE,
+       cexHubLabels = 3)
+}
+
+netTest <- function(x, g1, g2){
+        comp_net <- netCompare(x, permTest = FALSE, verbose = TRUE, cores = ncores)
+        a <- summary(comp_net, 
+                groupNames = c(g1, g2),
+                showCentr = "all", 
+                numbNodes = 20)
+        return(a)
+}
+
+netDiffPlot <- function(x, y, g1, g2, method){
+        net_season_pears <- netConstruct(x, y, 
+                                 filtTax = "highestVar",
+                                 filtTaxPar = list(highestVar = 50),
+                                 measure = "spearman", 
+                                 normMethod = "none",
+                                 sparsMethod = "none", 
+                                 thresh = 0.3,
+                                 cores = ncores,
+                                 verbose = 2,
+                                 seed = 123456)
+        
+        diff_season <- diffnet(net_season_pears,
+                       diffMethod = "fisherTest", 
+                       adjust = "lfdr")
+        
+        props_season_pears <- netAnalyze(net_season_pears, 
+                                 clustMethod = "cluster_fast_greedy",
+                                 weightDeg = TRUE,
+                                 normDeg = FALSE)
+        
+        diffmat_sums <- rowSums(diff_season$diffAdjustMat)
+        diff_asso_names <- names(diffmat_sums[diffmat_sums > 0])
+        
+        plot(props_season_pears, 
+             nodeFilter = "names",
+             nodeFilterPar = diff_asso_names,
+             nodeColor = "gray",
+             highlightHubs = FALSE,
+             sameLayout = TRUE, 
+             layoutGroup = "union",
+             rmSingles = FALSE, 
+             nodeSize = "clr",
+             edgeTranspHigh = 20,
+             labelScale = FALSE,
+             cexNodes = 0.9, 
+             cexLabels = 1,
+             cexTitle = 2.8,
+             groupNames = c(g1, g2),
+             hubBorderCol  = "gray40",
+             showTitle = FALSE)
+        return(diff_asso_names)
+}
+
+```
+
+#plot network
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+psObj1 <- ps.cs
+psObj2 <- ps.csw
+grNet1 <- "CS"
+grNet2 <- "CSW"
+network <- netFun(psObj1, psObj2, method = "sparcc")
+netPlot(network, grNet1, grNet2)
+```
+# network statistics
+```{r}
+netTest(network, grNet1, grNet2)
+```
+
+# Core microbiome analysis
+```{r}
+ps.dataset.cm <- microbiome::transform(ps, "compositional")
+ps.CS <- subset_samples(ps.dataset.cm, Rotation == "CS")
+ps.CSW <- subset_samples(ps.dataset.cm, Rotation == "CSW")
+core.taxa.CS <- core_members(ps.CS, detection = 0.001, prevalence = 95/100)
+core.taxa.CSW <- core_members(ps.CSW, detection = 0.001, prevalence = 95/100)
+ps.NC <- subset_samples(ps.dataset.cm, Cover == "No Cover")
+ps.RYE <- subset_samples(ps.dataset.cm, Cover == "Rye")
+core.taxa.NC <- core_members(ps.NC, detection = 0.001, prevalence = 95/100)
+core.taxa.RYE <- core_members(ps.RYE, detection = 0.001, prevalence = 95/100)
+```
+
+```{r}
+df <- psmelt(ps.dataset.cm)
+```
+```{r}
+df.RA <- aggregate(df$Abundance, by = list(Genus = df$Genus), FUN=sum) 
+df.RA <- dplyr::rename(df.RA, TotalRA = `x`)
+
+#Determining 95th quantile of the RA data.
+quantile.95.abund <- quantile(df.RA$TotalRA, 0.95)
+
+#Selecting for genera that fit the 95th cutoff.
+taxa.95 <- subset(df.RA, TotalRA >= quantile.95.abund) 
+taxa.95.genus <- taxa.95$Genus
+
+#Determine the frequency 95th cutoff. We go back and use the original phyloseq object and agglomerate the data by Genus tax rank (it could be any tax rank you want e.g., Phylum, Family).
+ps.genus <- tax_glom(ps, "Genus")
+ASVs.genus <- otu_table(ps.genus)
+df.ASVs.genus <- as.data.frame(ASVs.genus)
+rownames(df.ASVs.genus) <- as.data.frame(tax_table(ps.genus))$Genus
+
+#Create a table of presence/abundance of ASVs. We will use 1 if present, 0 if not.
+df.PA <- 1*((df.ASVs.genus>0)==1)
+Occupancy <- rowSums(df.PA)/ncol(df.PA) #Calculate occupancy
+df.Freq <- as.data.frame(cbind(df.PA, Occupancy))
+df.Freq <- tibble::rownames_to_column(df.Freq, "Genus")
+
+#Determining 95th quantile of the presence/abundance table.
+quantile.95.freq <- quantile(df.Freq$Occupancy, 0.95)
+
+#Select the genera that fit the 95th cutoff.
+Freq.95 <- subset(df.Freq, Occupancy >= quantile.95.freq) #select cutoff 
+Freq.95.genus <- Freq.95$Genus
+
+Quantile.95 <- merge.data.frame(Freq.95, taxa.95, by = "Genus")  
+
+
+Core.95.list <- list(Frequency = Freq.95.genus, Relative_abundance = taxa.95.genus)
+
+plot.VennD <- ggvenn(Core.95.list,
+            stroke_size = 0.5, set_name_size = 3.2, text_size = 3)
+
+print(plot.VennD)
+
+#Side note: Plot a Venn Diagram to see how many taxa made the cutoffs. (Click to expand)
+#Get the list of your core taxa based on the 95th percentile.
+Core.95.intersect <- Reduce(intersect, Core.95.list)
+
+#Subset your original phyloseq object for core taxa.
+ps.Core <- subset_taxa(ps, Genus %in% c(Core.95.intersect))
+
+#Fix the relative abundance of the core taxa to continue with the plot.
+# Agglomerate taxa by genus level
+Core_genera <- tax_glom(ps.Core, taxrank = "Genus", NArm = FALSE)
+
+# Get relative abundance in %
+Core_genera.RA <- transform_sample_counts(Core_genera , function(x) 100 * x/sum(x))
+
+#Transform to a data frame
+df.Core_genera <- psmelt(Core_genera.RA)
+```
+# Core microbiome plot
+```{r}
+df.Core_genera %>%
+  group_by(Genus, Cover, Location,) %>%
+  summarize(abundance = mean(Abundance)) %>%
+  ggplot(aes(Cover, Genus)) +
+  facet_wrap(~Location) +
+  geom_point(aes(size = abundance), color = "grey30", fill = "#66A61E",
+             alpha = 0.5, shape = 21, stroke = 0.1) +
+  scale_size_continuous(range = c(0,8), breaks = c(1, 3, 5, 8, 10),
+                        name="Relative\nAbundance (%)") +
+  scale_x_discrete(name ="Cover") +
+  theme_bw()
+```

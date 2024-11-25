@@ -1,0 +1,294 @@
+---
+title: "Correlation Analysis and Variance Partitioning"
+output: html_document
+date: "2024-11-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+#load packages
+```{r}
+library(ggplot2)
+library(ggpubr)
+library(tidyverse)
+library(broom)
+library(AICcmodavg)
+library(agricolae)
+library(psych)
+library(corrplot)
+library(ggplot2)
+library(car)
+library("variancePartition")
+```
+#Select variables
+```{r}
+#fullset
+myvars <- c(
+"Moisture",
+"Yield",
+"POXC",
+"Protein",
+"SOM",
+"Respiration", 
+"ObservedF",
+"ShannonF",
+"ObservedAMF",
+"ShannonAMF",
+"BACObserved",
+"BACShannon",
+"DESEQCSWF21",
+"DESEQCSWF21",
+"DESEQNOCOVF21",
+"DESEQRYEF21",
+"DESEQCSAMF21",
+"DESEQCSWAMF21",
+"DESEQNOCOVAMF21",
+"DESEQRyeAMF21",
+"INDICCSB21",
+"INDICCSWB21",
+"INDICNOCOVB21",
+"INDICRYEB21",
+"FUSARIUM",
+"TRICHODERMA",
+"MORTIERELLA",
+"FUSICOLLA",
+"Saitozyma",
+"Tetracladium",
+"Solicoccozyma",
+"Penicillium",
+"Clonostachys",
+"Alternaria",
+"Arthrobotrys",
+"Ustilago",
+"Exophiala",
+"Neoascochyta",
+"TOP10FUNGASVS",
+"F21CSM0",
+"F21CSM1",
+"F21CSM2",
+"F21CSM3",
+"F21CSM4",
+"F21CSM5",
+"F21CSM6",
+"F21CSM7",
+"F21CSM8",
+"F21CSM9",
+"F21CSM10",
+"F21CSM11",
+"F21CSM12",
+"F21CSWM0",
+"F21CSWM1",
+"F21CSWM2",
+"F21CSWM3",
+"F21CSWM4",
+"F21CSWM5",
+"F21CSWM6",
+"F21CSWM7",
+"F21CSWM8",
+"F21CSWM9",
+"F21CSWM10",
+"F21CSWM11",
+"F21CSWM12",
+"F21NCM0",
+"F1NCM1",
+"F1NCM2",
+"F21NCM3",
+"F21NCM4",
+"F21NCM5",
+"F21NCM6",
+"F21NCM7",
+"F21NCM8",
+"F21NCM9",
+"F21NCM10",
+"F21NCM11",
+"F21NCM12",
+"F21RYEM0",
+"F21RYEM1",
+"F21RYEM2",
+"F21RYEM3",
+"F21RYEM4",
+"F21RYEM5",
+"F21RYEM6",
+"F21RYEM7",
+"F21RYEM8",
+"F21RYEM9",
+"F21RYEM10",
+"F21RYEM11",
+"BAC21CSM1",
+"BAC21CSM2",
+"BAC21CSM3",
+"BAC21CSWM0",
+"BAC21CSWM1",
+"BAC21CSWM2",
+"BAC21CSWM3",
+"BAC21NCM0",
+"BAC21NCM1",
+"BAC21NCM2",
+"BAC21NCM3",
+"BAC21NCM4",
+"BAC21RYEM1",
+"BAC21RYEM2",
+"BAC21RYEM3",
+"BAC21RYEM4",
+"BAC21RYEM5"
+)
+RCCore2 <- rotccSTD[myvars]
+```
+#look at data
+```{r}
+describe(RCCoreMOD)
+dim(RCCoreMOD)
+```
+#clean data to remove ID variable
+```{r}
+dat <- RCCoreMOD[ , -1] 
+head(dat)
+```
+#correlation matrix
+```{r}
+datamatrix <- cor(dat[,c(-14)])
+corrplot(datamatrix, method="ellipse", tl.col = "black", tl.srt = 90, number.font = 1, tl.cex = 0.7)
+```
+```{r}
+cov(RCCoreFUN1)
+```
+#correlation scatterplots
+```{r}
+# scatterplot
+ggplot(rotccSTD, aes(POXC, F21CSWM3)) + 
+  geom_point(size = 2,color = "blue4") +
+  labs(x="POXC (mg C/kg soil)", y="Average Fungi 21 CSW Module 3 reads") +
+  theme_bw() +
+  geom_smooth(color="black", linetype = "dashed") + 
+  geom_smooth (method=lm, level =0 ) +
+  stat_cor(label.x = 420 , label.y = 150) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.text.x=element_text(size=13), axis.text.y=element_text(size=13), axis.title.x = element_text(size = 15),
+    axis.title.y = element_text(size = 15))
+
+
+```
+
+#data setup for variance partitioning
+<!-- Data setup -->
+
+
+```{r read-the-data}
+
+df <- 
+  readxl::read_xlsx("**data.xlsx", 
+  # readxl::read_xlsx("**data.xlsx",  
+                    sheet = "2122LL_CCROTFUNGIONLY",
+                    range = "A1:AQ50",
+                    na = c("NA", ".", "??")) %>%
+    # clean up the names a bit:
+  janitor::clean_names() %>%
+  # Select variables:
+  # NOTE: response variables are yield, poxc, soil_protein, soil_respiration
+  dplyr::select(year:cover, yield, poxc, soil_protein, soil_organic_matter, soil_respiration, soy_gsavgtc, soy_g_stotalprecipcm, soil_temp_avg4in, avg_relative_h, clay10cm, sand10cm, silt10cm, fusarium:neoascochyta) %>% 
+  dplyr::rename(air_temp = soy_gsavgtc, rain = soy_g_stotalprecipcm, soil_temp = soil_temp_avg4in, rh = avg_relative_h, clay = clay10cm, sand = sand10cm, silt = silt10cm) %>%
+  # Set factors and levels:
+  dplyr::mutate(location = factor(location, levels = c("NWARS", "WARS"))) %>% 
+  dplyr::mutate(rotation = factor(rotation, levels = c("CS", "CSW"))) %>% 
+  dplyr::mutate(cover = factor(cover, levels = c("No Cover", "Rye"))) %>% 
+  # log ratios for sand, silt, clay using silt as the baseline:
+  dplyr::mutate(lr.sand = log(sand) - log(silt)) %>%
+  dplyr::mutate(lr.clay = log(clay) - log(silt)) %>%
+  dplyr::select(-sand, -silt, -clay) %>%
+  # One-hot encode the factor variables:
+  # year
+  dplyr::mutate(yr_2021 = ifelse(year == "2021", 1, 0)) %>% 
+  dplyr::mutate(yr_2022 = ifelse(year == "2022", 1, 0)) %>%
+  # location
+  dplyr::mutate(loc_NWARS = ifelse(location == "NWARS", 1, 0)) %>% 
+  dplyr::mutate(loc_WARS = ifelse(location == "WARS", 1, 0)) %>% 
+  # rotation
+  dplyr::mutate(rot_CS = ifelse(rotation == "CS", 1, 0)) %>% 
+  dplyr::mutate(rot_CSW = ifelse(rotation == "CSW", 1, 0)) %>%
+  # cover crop
+  dplyr::mutate(cov_none = ifelse(cover == "No Cover", 1, 0)) %>% 
+  dplyr::mutate(cov_rye = ifelse(cover == "Rye", 1, 0)) %>%
+  dplyr::select(-location, -rotation, -cover) %>% 
+  # standardize continuous covariates to mean 0 and std dev 1:
+  dplyr::mutate(across(c(air_temp:rh, lr.sand, lr.clay),  ~ scale(.)[,1])) %>% 
+  # Center yield, poxc, soil_protein, soil_respiration at their sample means:
+  dplyr::mutate(across(c(yield, poxc, soil_protein, soil_organic_matter, soil_respiration), ~ . - mean(., na.rm = TRUE)))  %>% 
+ # Arrange the order of the columns so that the responses are first, then the continuous covariates, then the categorical covariates, then the species counts:
+  dplyr::select(yield:soil_respiration, soil_temp, air_temp, rain, rh, lr.sand, lr.clay, yr_2021:cov_rye, fusarium:neoascochyta) %>% 
+  # For neatness, title case for the genera:
+  dplyr::rename_with(.fn = stringr::str_to_title, .cols = fusarium:neoascochyta)
+
+# Covariate matrix 49 rows 14 covariates
+X <-
+  df %>% 
+  dplyr::select(yield:cov_rye) %>% 
+  as.matrix()
+
+# The taxon counts matrix 49 rows 14 taxa
+Z <-
+  df %>% 
+  dplyr::select(Fusarium:Neoascochyta) %>% 
+  as.matrix()
+```
+```{r}
+# Transpose matrix
+Zt <- t(Z)
+
+print(Zt)
+```
+```{r}
+# Specify variables to consider
+form <- ~ yield + poxc + soil_organic_matter + soil_respiration + soil_protein +  yr_2022 +  loc_NWARS + rot_CS + cov_none
+```
+
+
+```{r}
+varPart <- fitExtractVarPartModel(Zt, form, X)
+```
+```{r}
+# sort variables (i.e. columns) by median fraction
+#       of variance explained
+vp <- sortCols(varPart)
+
+# Figure 1a
+# Bar plot of variance fractions for the first 10 genes
+plotPercentBars(vp[1:10,]) + theme (axis.text.x = element_text(size = 13), axis.text.y = element_text(size = 13, ),legend.text=element_text(size=12))
+```
+```{r}
+# Figure 1b
+# violin plot of contribution of each variable to total variance
+plotVarPart(vp)
+```
+```{r}
+form <- ~ yield + poxc + soil_organic_matter + soil_respiration + soil_protein +  yr_2022 +  loc_NWARS + rot_CS + cov_none
+
+# Compute Canonical Correlation Analysis (CCA)
+# between all pairs of variables
+# returns absolute correlation value
+C <- canCorPairs(form, X)
+
+# Plot correlation matrix
+# between all pairs of variables
+plotCorrMatrix(C)
+```
